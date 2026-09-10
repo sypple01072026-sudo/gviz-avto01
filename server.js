@@ -7,94 +7,451 @@ const path = require('path');
 const crypto = require('crypto');
 
 const app = express();
-const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 50 * 1024 * 1024 } });
 
-// ВАЖНО: имена полей должны точно совпадать с тем, что шлёт n8n
-const LAYER_FIELDS = ['fon', 'topleft', 'inscription', 'animal', 'item', 'transport', 'niz-pravo'];
-const uploadFields = upload.fields([
-  ...LAYER_FIELDS.map((name) => ({ name, maxCount: 1 })),
-  { name: 'payload', maxCount: 1 }, // payload может прийти как поле-файл или как текст — примем оба
-]);
-
-app.get('/', (_req, res) => res.send('ok'));
-
-app.post('/render', uploadFields, async (req, res) => {
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'render-'));
-  const cleanup = () => fs.rmSync(work, { recursive: true, force: true });
-
-  try {
-    // payload может прийти либо в body (form field), либо как файл
-    let payload = {};
-    if (req.body && req.body.payload) {
-      payload = JSON.parse(req.body.payload);
-    } else if (req.files && req.files.payload && req.files.payload[0]) {
-      payload = JSON.parse(fs.readFileSync(req.files.payload[0].path, 'utf8'));
-    }
-
-    // Собираем пути к загруженным слоям
-    const files = {};
-    for (const name of LAYER_FIELDS) {
-      if (req.files && req.files[name] && req.files[name][0]) {
-        files[name] = req.files[name][0].path;
-      }
-    }
-    if (!files.fon) {
-      return res.status(400).json({ error: 'Missing required layer: fon' });
-    }
-
-    const duration = Number(payload.duration) || 13;
-    const out = path.join(work, 'out.mp4');
-
-    // Порядок наложения: фон -> остальные слои поверх
-    const overlayOrder = ['transport', 'animal', 'item', 'niz-pravo', 'inscription', 'topleft'];
-    const present = overlayOrder.filter((n) => files[n]);
-
-    // Входы ffmpeg: 0 = фон, далее слои
-    const inputs = ['-loop', '1', '-i', files.fon];
-    present.forEach((n) => inputs.push('-loop', '1', '-i', files[n]));
-
-    // Фильтр: масштабируем фон в 1080x1920, накладываем слои по центру
-    let filter = '[0:v]scale=1080:1920,setsar=1[bg];';
-    let last = 'bg';
-    present.forEach((n, i) => {
-      const idx = i + 1;
-      filter += `[${idx}:v]scale=1080:1920:force_original_aspect_ratio=decrease[l${idx}];`;
-      const next = i === present.length - 1 ? 'vout' : `t${idx}`;
-      filter += `[${last}][l${idx}]overlay=(W-w)/2:(H-h)/2[${next}];`;
-      last = next;
-    });
-
-    const args = [
-      '-y',
-      ...inputs,
-      '-filter_complex', filter,
-      '-map', '[vout]',
-      '-t', String(duration),
-      '-r', '30',
-      '-pix_fmt', 'yuv420p',
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      out,
-    ];
-
-    execFile('ffmpeg', args, { maxBuffer: 1024 * 1024 * 64 }, (err, _stdout, stderr) => {
-      if (err) {
-        cleanup();
-        return res.status(500).json({ error: 'ffmpeg failed', details: String(stderr).slice(-2000) });
-      }
-      const filename = `quiz_${crypto.randomBytes(4).toString('hex')}.mp4`;
-      res.setHeader('Content-Type', 'video/mp4');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      const stream = fs.createReadStream(out);
-      stream.pipe(res);
-      stream.on('close', cleanup);
-      stream.on('error', cleanup);
-    });
-  } catch (e) {
-    cleanup();
-    res.status(500).json({ error: 'render error', details: String(e.message || e) });
+const upload = multer({
+  dest: os.tmpdir(),
+  limits: {
+    fileSize: 50 * 1024 * 1024
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`render server on :${PORT}`));
+// ========================================
+// ДИАГНОСТИКА
+// Временно принимаем ЛЮБЫЕ file-поля
+// ========================================
+const uploadFields = upload.any();
+
+app.get('/', (_req, res) => {
+  res.send('ok');
+});
+
+app.post('/render', uploadFields, async (req, res) => {
+
+  // ========================================
+  // ПОКАЗЫВАЕМ, ЧТО ПРИСЛАЛ N8N
+  // ========================================
+
+  console.log('========================================');
+  console.log('FILES FROM N8N:');
+
+  if (req.files && req.files.length > 0) {
+    console.log(
+      req.files.map((file) => ({
+        fieldname: file.fieldname,
+        originalname: file.originalname,
+        mimetype: file.mimetype,
+        size: file.size,
+        path: file.path
+      }))
+    );
+  } else {
+    console.log('NO FILES');
+  }
+
+  console.log('========================================');
+  console.log('FIELD NAMES ONLY:');
+
+  if (req.files) {
+    console.log(req.files.map((file) => file.fieldname));
+  }
+
+  console.log('========================================');
+  console.log('BODY:');
+  console.log(req.body);
+
+  console.log('========================================');
+
+
+  // ========================================
+  // РАБОЧАЯ ПАПКА
+  // ========================================
+
+  const work = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'render-')
+  );
+
+  const cleanup = () => {
+    try {
+      fs.rmSync(work, {
+        recursive: true,
+        force: true
+      });
+    } catch (e) {
+      console.error('Cleanup error:', e.message);
+    }
+  };
+
+
+  try {
+
+    // ========================================
+    // СОБИРАЕМ PAYLOAD
+    // ========================================
+
+    let payload = {};
+
+    // payload как обычное текстовое поле
+    if (req.body && req.body.payload) {
+
+      console.log('PAYLOAD TYPE: text field');
+
+      try {
+        payload = JSON.parse(req.body.payload);
+      } catch (e) {
+        cleanup();
+
+        return res.status(400).json({
+          error: 'Invalid payload JSON',
+          details: e.message
+        });
+      }
+
+    } else {
+
+      // payload как файл
+      const payloadFile = req.files?.find(
+        (file) => file.fieldname === 'payload'
+      );
+
+      if (payloadFile) {
+
+        console.log('PAYLOAD TYPE: file');
+
+        try {
+          payload = JSON.parse(
+            fs.readFileSync(payloadFile.path, 'utf8')
+          );
+        } catch (e) {
+          cleanup();
+
+          return res.status(400).json({
+            error: 'Invalid payload JSON file',
+            details: e.message
+          });
+        }
+
+      } else {
+        console.log('PAYLOAD: not found');
+      }
+    }
+
+
+    // ========================================
+    // РАЗРЕШЁННЫЕ СЛОИ
+    // ========================================
+
+    const LAYER_FIELDS = [
+      'fon',
+      'topleft',
+      'inscription',
+      'animal',
+      'item',
+      'transport',
+      'niz-pravo'
+    ];
+
+
+    // ========================================
+    // СОБИРАЕМ ФАЙЛЫ СЛОЁВ
+    // ========================================
+
+    const files = {};
+
+    for (const name of LAYER_FIELDS) {
+
+      const file = req.files?.find(
+        (f) => f.fieldname === name
+      );
+
+      if (file) {
+        files[name] = file.path;
+
+        console.log(
+          `FOUND LAYER: ${name} -> ${file.originalname}`
+        );
+      }
+    }
+
+
+    // ========================================
+    // ПРОВЕРКА ФОНА
+    // ========================================
+
+    if (!files.fon) {
+
+      cleanup();
+
+      return res.status(400).json({
+        error: 'Missing required layer: fon',
+
+        received_fields: req.files
+          ? req.files.map((f) => f.fieldname)
+          : []
+      });
+    }
+
+
+    // ========================================
+    // DURATION
+    // ========================================
+
+    const duration =
+      Number(payload.duration) || 13;
+
+
+    console.log('DURATION:', duration);
+
+
+    // ========================================
+    // OUTPUT
+    // ========================================
+
+    const out = path.join(
+      work,
+      'out.mp4'
+    );
+
+
+    // ========================================
+    // ПОРЯДОК НАЛОЖЕНИЯ
+    // ========================================
+
+    const overlayOrder = [
+      'transport',
+      'animal',
+      'item',
+      'niz-pravo',
+      'inscription',
+      'topleft'
+    ];
+
+    const present = overlayOrder.filter(
+      (name) => files[name]
+    );
+
+
+    console.log('LAYERS FOUND:', present);
+
+
+    // ========================================
+    // INPUTS FFMPEG
+    // ========================================
+
+    const inputs = [
+      '-loop',
+      '1',
+      '-i',
+      files.fon
+    ];
+
+    present.forEach((name) => {
+
+      inputs.push(
+        '-loop',
+        '1',
+        '-i',
+        files[name]
+      );
+
+    });
+
+
+    // ========================================
+    // FILTER COMPLEX
+    // ========================================
+
+    let filter =
+      '[0:v]scale=1080:1920,setsar=1[bg];';
+
+
+    let last = 'bg';
+
+
+    present.forEach((name, i) => {
+
+      const idx = i + 1;
+
+      filter +=
+        `[${idx}:v]scale=1080:1920:` +
+        `force_original_aspect_ratio=decrease` +
+        `[l${idx}];`;
+
+      const next =
+        i === present.length - 1
+          ? 'vout'
+          : `t${idx}`;
+
+      filter +=
+        `[${last}][l${idx}]` +
+        `overlay=(W-w)/2:(H-h)/2` +
+        `[${next}];`;
+
+      last = next;
+
+    });
+
+
+    // ========================================
+    // ЕСЛИ НЕТ НИ ОДНОГО СЛОЯ
+    // ========================================
+
+    if (present.length === 0) {
+
+      filter =
+        '[0:v]scale=1080:1920,setsar=1[vout];';
+
+    }
+
+
+    console.log('FFMPEG FILTER:');
+    console.log(filter);
+
+
+    // ========================================
+    // FFMPEG ARGUMENTS
+    // ========================================
+
+    const args = [
+      '-y',
+
+      ...inputs,
+
+      '-filter_complex',
+      filter,
+
+      '-map',
+      '[vout]',
+
+      '-t',
+      String(duration),
+
+      '-r',
+      '30',
+
+      '-pix_fmt',
+      'yuv420p',
+
+      '-c:v',
+      'libx264',
+
+      '-preset',
+      'veryfast',
+
+      out
+    ];
+
+
+    console.log('STARTING FFMPEG...');
+
+
+    // ========================================
+    // ЗАПУСК FFMPEG
+    // ========================================
+
+    execFile(
+      'ffmpeg',
+      args,
+      {
+        maxBuffer: 1024 * 1024 * 64
+      },
+      (err, _stdout, stderr) => {
+
+        if (err) {
+
+          console.error(
+            'FFMPEG ERROR:',
+            stderr
+          );
+
+          cleanup();
+
+          return res.status(500).json({
+            error: 'ffmpeg failed',
+            details: String(stderr).slice(-2000)
+          });
+        }
+
+
+        // ========================================
+        // ИМЯ ФАЙЛА
+        // ========================================
+
+        const filename =
+          `quiz_${crypto.randomBytes(4).toString('hex')}.mp4`;
+
+
+        // ========================================
+        // ОТДАЁМ MP4 В N8N
+        // ========================================
+
+        res.setHeader(
+          'Content-Type',
+          'video/mp4'
+        );
+
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${filename}"`
+        );
+
+
+        const stream =
+          fs.createReadStream(out);
+
+
+        stream.pipe(res);
+
+
+        stream.on('close', cleanup);
+
+        stream.on('error', (error) => {
+
+          console.error(
+            'STREAM ERROR:',
+            error.message
+          );
+
+          cleanup();
+
+        });
+
+      }
+    );
+
+
+  } catch (e) {
+
+    console.error(
+      'RENDER ERROR:',
+      e
+    );
+
+    cleanup();
+
+    return res.status(500).json({
+      error: 'render error',
+      details: String(
+        e.message || e
+      )
+    });
+
+  }
+
+});
+
+
+// ========================================
+// SERVER
+// ========================================
+
+const PORT =
+  process.env.PORT || 3000;
+
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `render server on :${PORT}`
+    );
+  }
+);
