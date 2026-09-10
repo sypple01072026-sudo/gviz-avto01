@@ -179,7 +179,9 @@ app.post(
 
     const args = [
       '-y',
-      '-loop', '1', '-i', f.fon[0].path,
+      // fon теперь ВИДЕО (.mp4) — используем -stream_loop, а НЕ -loop
+      '-stream_loop', '-1', '-i', f.fon[0].path,
+      // остальные 6 слоёв — картинки (PNG), им нужен -loop 1
       '-loop', '1', '-i', f.topleft[0].path,
       '-loop', '1', '-i', f.inscription[0].path,
       '-loop', '1', '-i', f.animal[0].path,
