@@ -22,8 +22,9 @@ const QUESTION_FONT = 40;
 const HOOK_FONT = 40;
 const ANSWER_FONT = 34;
 
-const QUESTION_CY = 352;
-const ANSWER_CY = [581, 687, 789];
+// === РАСПОЛОЖЕНИЕ ТЕКСТА (по разметке) ===
+const QUESTION_CY = 529;            // центр вопроса: 529,3 пкс от верха
+const ANSWER_CY = [785, 890, 991];  // центры ответов: 785,2 / 889,75 / 991,06
 const QUESTION_WRAP = 24;
 const ANSWER_WRAP = 22;
 
@@ -81,7 +82,7 @@ app.post(
     { name: 'animal', maxCount: 1 },
     { name: 'item', maxCount: 1 },
     { name: 'transport', maxCount: 1 },
-    { name: 'niz-pravo', maxCount: 1 },   // FIX 1: 7-й слой, который шлёт n8n
+    { name: 'niz-pravo', maxCount: 1 },
   ]),
   (req, res) => {
     let payload = {};
@@ -110,7 +111,6 @@ app.post(
     const outPath = path.join(os.tmpdir(), 'out_' + Date.now() + '.mp4');
 
     const segs = [];
-    // FIX 1: overlay всех 6 слоёв поверх фона (fon=0 ... niz-pravo=6)
     segs.push('[0:v]scale=' + W + ':' + H + ',setsar=1,fps=' + FPS + '[b]');
     segs.push('[b][1:v]overlay=0:0[o1]');
     segs.push('[o1][2:v]overlay=0:0[o2]');
@@ -141,7 +141,7 @@ app.post(
       const ans = answers[i];
       if (ans == null) continue;
       const appear = answerStart + i * answerStep;
-      const cy = ANSWER_CY[i] != null ? ANSWER_CY[i] : (581 + i * 106);
+      const cy = ANSWER_CY[i] != null ? ANSWER_CY[i] : (785 + i * 105);
       const wrapped = wrap(ans, ANSWER_WRAP);
 
       if (i === correctIndex) {
@@ -161,7 +161,7 @@ app.post(
       }
     }
 
-    let prev = 'o6';   // FIX 1: цепочка drawtext начинается после o6
+    let prev = 'o6';
     draws.forEach((d, idx) => {
       const out = 'd' + idx;
       segs.push('[' + prev + ']' + d + '[' + out + ']');
@@ -179,7 +179,6 @@ app.post(
 
     const args = [
       '-y',
-      // FIX 2: -loop 1 на каждом входе, иначе PNG = 1 кадр и тайминги не работают
       '-loop', '1', '-i', f.fon[0].path,
       '-loop', '1', '-i', f.topleft[0].path,
       '-loop', '1', '-i', f.inscription[0].path,
